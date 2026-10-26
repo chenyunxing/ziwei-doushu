@@ -158,11 +158,11 @@ export default function ChartBoard({ chart, onStarSelect, onPalaceSelect, onSiHu
           </div>
 
           <div className="text-center space-y-1">
-            <div className="text-[9px] tracking-[0.3em] font-medium" style={{ color: 'var(--t-gold)' }}>紫微斗数</div>
-            <div className="text-[10px] space-y-0.5" style={{ color: 'var(--t-faint)' }}>
+            <div className="text-[14px] tracking-[0.3em] font-medium" style={{ color: 'var(--t-gold)' }}>紫微斗数</div>
+            <div className="text-[15px] space-y-0.5" style={{ color: 'var(--t-faint)' }}>
               <div>命宫 <span style={{ color: 'var(--t-gold)', opacity: 0.7 }}>{BRANCHES[chart.mingGongBranch]}</span></div>
               <div>身宫 <span className="text-sky-500/70">{BRANCHES[chart.shenGongBranch]}</span></div>
-              <div className="text-[9px]" style={{ color: 'var(--t-gold)', opacity: 0.75 }}>{chart.wuxingJuName}</div>
+              <div className="text-[14px]" style={{ color: 'var(--t-gold)', opacity: 0.75 }}>{chart.wuxingJuName}</div>
             </div>
           </div>
 
@@ -171,14 +171,14 @@ export default function ChartBoard({ chart, onStarSelect, onPalaceSelect, onSiHu
             return (
               <div className="border border-purple-500/30 rounded-lg px-3 py-1.5 text-center"
                 style={{ background: 'rgba(147,51,234,0.06)' }}>
-                <div className="text-[8px] text-purple-500/80 mb-0.5 tracking-wider">当前大限</div>
-                <div className="text-[12px] text-purple-400 font-medium tabular-nums">{dx.startAge}–{dx.endAge}岁</div>
-                <div className="text-[9px] text-purple-500/60">{dx.palaceName}</div>
+                <div className="text-[13px] text-purple-500/80 mb-0.5 tracking-wider">当前大限</div>
+                <div className="text-[16px] text-purple-400 font-medium tabular-nums">{dx.startAge}–{dx.endAge}岁</div>
+                <div className="text-[14px] text-purple-500/60">{dx.palaceName}</div>
               </div>
             );
           })()}
 
-          <div className="text-[8px] text-center leading-relaxed font-mono" style={{ color: 'var(--t-faint)', opacity: 0.75 }}>
+          <div className="text-[13px] text-center leading-relaxed font-mono" style={{ color: 'var(--t-faint)', opacity: 0.75 }}>
             {chart.lunarInfo.lunarYear}·{chart.lunarInfo.isLeapMonth ? '闰' : ''}
             {chart.lunarInfo.lunarMonth}·{chart.lunarInfo.lunarDay}
           </div>
@@ -266,7 +266,7 @@ export default function ChartBoard({ chart, onStarSelect, onPalaceSelect, onSiHu
         initial={{ opacity: 0 }}
         animate={{ opacity: 1 }}
         transition={{ delay: 0.7 }}
-        className="mt-3 flex items-center justify-center gap-2 text-[9px] flex-wrap"
+        className="mt-3 flex items-center justify-center gap-2 text-[13px] flex-wrap"
       >
         {[
           { h: '化禄', c: 'text-emerald-500 border-emerald-500/30' },

@@ -2,12 +2,17 @@
 import { useState, useRef, useEffect } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
 import type { ZiweiChart, Palace } from '@/lib/ziwei/types';
+import type { TopicKey } from '@/lib/ziwei/db-analysis';
+import { topicForPalace } from '@/lib/interp/topics';
+import { readSse } from '@/lib/ai/read-sse';
 import type { TimeView } from './TimeNav';
 
 interface Message {
   role: 'user' | 'assistant';
   content: string;
-  hidden?: boolean; // don't show user bubble for auto/topic messages
+  reasoning?: string;
+  hidden?: boolean;
+  kind?: 'ask' | 'detail';
 }
 
 interface SelectedSiHua {
@@ -144,30 +149,53 @@ const PALACE_ROLES: Record<string, string> = {
   '父母宫': '父母关系、文书契约',
 };
 
+function ThinkingBlock({ text, streaming }: { text: string; streaming?: boolean }) {
+  const [open, setOpen] = useState(false);
+  if (!text) return null;
+  return (
+    <div className="rounded-xl px-3 py-2" style={{ background: 'var(--t-card)', border: '1px solid var(--t-border)' }}>
+      <button
+        type="button"
+        onClick={() => setOpen(v => !v)}
+        className="text-[14px] w-full text-left"
+        style={{ color: 'var(--t-faint)' }}
+      >
+        {open ? '收起思考过程' : '展开思考过程'}
+        {streaming ? ' · 思考中' : ''}
+      </button>
+      {open && (
+        <div className="mt-2 max-h-64 overflow-y-auto">
+          <AiContent text={text} streaming={streaming} muted />
+        </div>
+      )}
+    </div>
+  );
+}
+
 /** Render AI markdown: **【Title】** → gold header, **bold** → strong */
-function AiContent({ text, streaming }: { text: string; streaming?: boolean }) {
+function AiContent({ text, streaming, muted }: { text: string; streaming?: boolean; muted?: boolean }) {
   const lines = text.split('\n');
   return (
-    <div className="space-y-0.5">
+    <div className="space-y-1">
       {lines.map((line, i) => {
         const sectionMatch = line.match(/^\*\*【(.+?)】\*\*$/);
         if (sectionMatch) {
           return (
             <div key={i} className="pt-3 pb-0.5 first:pt-0">
-              <span className="text-[11px] font-semibold tracking-wide" style={{ color: 'var(--t-gold)' }}>
+              <span className="text-[16px] font-semibold tracking-wide" style={{ color: muted ? 'var(--t-faint)' : 'var(--t-gold)' }}>
                 【{sectionMatch[1]}】
               </span>
             </div>
           );
         }
-        if (line.trim() === '') return <div key={i} className="h-1" />;
+        if (line.trim() === '') return <div key={i} className="h-1.5" />;
         const parts = line.split(/\*\*(.+?)\*\*/);
         return (
-          <div key={i} className="text-[11px] leading-relaxed" style={{ color: 'var(--t-text2)' }}>
+          <div key={i} className="text-[15px] leading-relaxed" style={{ color: muted ? 'var(--t-faint)' : 'var(--t-text2)' }}>
             {parts.map((part, j) =>
               j % 2 === 0
                 ? part
-                : <strong key={j} className="font-medium" style={{ color: 'var(--t-text)' }}>{part}</strong>
+                : <strong key={j} className="font-medium" style={{ color: muted ? 'var(--t-text2)' : 'var(--t-text)' }}>{part}</strong>
             )}
           </div>
         );
@@ -182,48 +210,71 @@ function AiContent({ text, streaming }: { text: string; streaming?: boolean }) {
   );
 }
 
+async function fetchCorpus(items: { chart: ZiweiChart; topics: TopicKey[]; who?: string }[]): Promise<string> {
+  const res = await fetch('/api/corpus', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ items }),
+  });
+  if (!res.ok) throw new Error('corpus');
+  const data = await res.json() as { text?: string };
+  return data.text ?? '';
+}
+
 export default function InsightPanel({ chart, selectedPalace, selectedSiHua }: InsightPanelProps) {
   const [messages, setMessages] = useState<Message[]>([]);
+  const [corpus, setCorpus] = useState('');
+  const [corpusLoading, setCorpusLoading] = useState(false);
+  const [tab, setTab] = useState<'corpus' | 'ai'>('corpus');
   const [input, setInput] = useState('');
   const [loading, setLoading] = useState(false);
   const [activeTopic, setActiveTopic] = useState<string>('overview');
-  const messagesRef = useRef<Message[]>([]); // always-current copy for closures
+  const messagesRef = useRef<Message[]>([]);
   const loadingRef = useRef(false);
-  const autoLoaded = useRef(false);
+  const focusPrompt = useRef<string | null>(null);
   const lastPalaceBranch = useRef<number | undefined>(undefined);
   const lastSiHuaKey = useRef<string | undefined>(undefined);
   const scrollRef = useRef<HTMLDivElement>(null);
 
-  // Keep refs in sync
   useEffect(() => { messagesRef.current = messages; }, [messages]);
   useEffect(() => { loadingRef.current = loading; }, [loading]);
 
-  // Auto-scroll
   useEffect(() => {
-    if (scrollRef.current) {
-      scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
-    }
+    if (scrollRef.current) scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
   }, [messages]);
 
-  // Auto-generate 命格总览 on mount
-  useEffect(() => {
-    if (autoLoaded.current) return;
-    autoLoaded.current = true;
-    sendMessage(TOPIC_PROMPTS.overview, true);
-  }, []); // eslint-disable-line react-hooks/exhaustive-deps
+  const loadCorpus = async (topics: TopicKey[]) => {
+    setCorpusLoading(true);
+    try {
+      setCorpus(await fetchCorpus([{ chart, topics }]));
+    } catch {
+      setCorpus('成稿读取失败。');
+    } finally {
+      setCorpusLoading(false);
+    }
+  };
 
-  // Inject palace analysis when palace selected
+  useEffect(() => {
+    setActiveTopic('overview');
+    setMessages([]);
+    focusPrompt.current = null;
+    lastPalaceBranch.current = undefined;
+    lastSiHuaKey.current = undefined;
+    void loadCorpus(['overview']);
+  }, [chart]); // eslint-disable-line react-hooks/exhaustive-deps
+
   useEffect(() => {
     if (!selectedPalace || selectedPalace.branch === lastPalaceBranch.current) return;
     lastPalaceBranch.current = selectedPalace.branch;
-
+    const topic = topicForPalace(selectedPalace.name);
+    setActiveTopic(topic);
+    setMessages([]);
     const majorStars = selectedPalace.stars.filter(s => s.type === 'major');
     const starDesc = majorStars.length > 0
       ? majorStars.map(s => `${s.name}${s.siHua ? '化' + s.siHua : ''}`).join('、')
       : '空宫（借对宫）';
-    const role = PALACE_ROLES[selectedPalace.name] ?? '';
-
-    const prompt = `请重点分析【${selectedPalace.name}】（主管：${role}），该宫主星为${starDesc}，按以下结构输出：
+    const role = PALACE_ROLES[selectedPalace.name] ?? PALACE_ROLES[`${selectedPalace.name.replace(/宫$/, '')}宫`] ?? '';
+    focusPrompt.current = `请重点分析【${selectedPalace.name}】（主管：${role}），该宫主星为${starDesc}，按以下结构输出：
 
 **【宫位定性】**
 ${selectedPalace.name}在命盘中的意义，以及这种星曜配置的整体判断。
@@ -236,25 +287,24 @@ ${selectedPalace.name}在命盘中的意义，以及这种星曜配置的整体�
 
 **【实际建议】**
 基于此宫的具体建议。`;
-
-    sendMessage(prompt, true);
+    void loadCorpus([topic]);
   }, [selectedPalace]); // eslint-disable-line react-hooks/exhaustive-deps
 
-  // 注入四化飞化分析
   useEffect(() => {
     if (!selectedSiHua) return;
     const key = `${selectedSiHua.starName}-${selectedSiHua.siHua}-${selectedSiHua.view}`;
     if (key === lastSiHuaKey.current) return;
     lastSiHuaKey.current = key;
-
-    // 找出该星所在宫位
-    const palaceOfStar = chart.palaces.find(p =>
-      p.stars.some(s => s.name === selectedSiHua.starName)
-    );
+    const palaceOfStar = chart.palaces.find(p => p.stars.some(s => s.name === selectedSiHua.starName));
     const palaceName = palaceOfStar?.name ?? '未知宫位';
     const viewLabel = selectedSiHua.view === 'daxian' ? '大限' : '流年';
-
-    const prompt = `请分析【${viewLabel}${selectedSiHua.starName}化${selectedSiHua.siHua}】的飞化影响，按以下结构输出：
+    if (palaceOfStar) {
+      const topic = topicForPalace(palaceOfStar.name);
+      setActiveTopic(topic);
+      setMessages([]);
+      void loadCorpus([topic]);
+    }
+    focusPrompt.current = `请分析【${viewLabel}${selectedSiHua.starName}化${selectedSiHua.siHua}】的飞化影响，按以下结构输出：
 
 **【化${selectedSiHua.siHua}基本含义】**
 化${selectedSiHua.siHua}在倪海厦体系中的核心含义，以及${selectedSiHua.starName}化${selectedSiHua.siHua}的特殊含义。
@@ -270,46 +320,41 @@ ${selectedSiHua.starName}化${selectedSiHua.siHua}落在【${palaceName}】，�
 
 **【实际建议】**
 基于此四化的具体可操作建议。`;
-
-    sendMessage(prompt, true);
+    setTab('ai');
   }, [selectedSiHua]); // eslint-disable-line react-hooks/exhaustive-deps
 
-  const streamResponse = async (apiMessages: { role: 'user' | 'assistant'; content: string }[]) => {
+  const streamResponse = async (
+    apiMessages: { role: 'user' | 'assistant'; content: string }[],
+    corpusForAsk?: string,
+  ) => {
+    const kind: 'ask' | 'detail' = corpusForAsk ? 'ask' : 'detail';
     try {
       const res = await fetch('/api/interpret', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ chart, messages: apiMessages }),
+        body: JSON.stringify({ chart, messages: apiMessages, corpus: corpusForAsk }),
       });
       if (res.status === 404) throw new Error('api-missing');
       if (!res.ok) throw new Error('请求失败');
       if (!res.body) throw new Error('无响应流');
 
-      const reader = res.body.getReader();
-      const decoder = new TextDecoder();
-      let assistantText = '';
-
-      setMessages(prev => [...prev, { role: 'assistant', content: '' }]);
-
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        const chunk = decoder.decode(value, { stream: true });
-        for (const line of chunk.split('\n')) {
-          if (!line.startsWith('data: ')) continue;
-          const data = line.slice(6);
-          if (data === '[DONE]') break;
-          try {
-            const delta = JSON.parse(data).delta?.text ?? '';
-            assistantText += delta;
-            setMessages(prev => {
-              const updated = [...prev];
-              updated[updated.length - 1] = { role: 'assistant', content: assistantText };
-              return updated;
-            });
-          } catch { /* skip */ }
-        }
-      }
+      setMessages(prev => [...prev, { role: 'assistant', content: '', reasoning: '', kind }]);
+      await readSse(res.body, (ev) => {
+        const text = ev.delta?.text ?? '';
+        const reasoning = ev.delta?.reasoning ?? '';
+        if (!text && !reasoning) return;
+        setMessages(prev => {
+          const updated = [...prev];
+          const last = updated[updated.length - 1];
+          if (!last || last.role !== 'assistant') return updated;
+          updated[updated.length - 1] = {
+            ...last,
+            content: text ? last.content + text : last.content,
+            reasoning: reasoning ? `${last.reasoning ?? ''}${reasoning}` : last.reasoning,
+          };
+          return updated;
+        });
+      });
     } catch (e) {
       const missing = e instanceof Error && e.message === 'api-missing';
       setMessages(prev => [...prev, { role: 'assistant', content: missing ? '开源版不含 AI 解读接口（/api/interpret），需要你自己实现后才能用，详见 README「快速开始」。排盘本身不需要任何 API Key。' : '解读失败，请稍后重试。' }]);
@@ -319,12 +364,12 @@ ${selectedSiHua.starName}化${selectedSiHua.siHua}落在【${palaceName}】，�
     }
   };
 
-  const sendMessage = (text: string, hidden = false) => {
+  const sendMessage = (text: string, hidden = false, corpusForAsk?: string) => {
     if (!text.trim() || loadingRef.current) return;
     loadingRef.current = true;
     setLoading(true);
 
-    const userMsg: Message = { role: 'user', content: text, hidden };
+    const userMsg: Message = { role: 'user', content: text, hidden, kind: corpusForAsk ? 'ask' : 'detail' };
     // Capture current messages synchronously via ref (avoids stale closure)
     const apiMessages = [...messagesRef.current, userMsg].map(m => ({
       role: m.role,
@@ -333,17 +378,26 @@ ${selectedSiHua.starName}化${selectedSiHua.siHua}落在【${palaceName}】，�
 
     setMessages(prev => [...prev, userMsg]);
     setInput('');
-    streamResponse(apiMessages);
+    streamResponse(apiMessages, corpusForAsk);
   };
 
   const handleTopicClick = (topicKey: string) => {
-    if (loadingRef.current) return;
+    focusPrompt.current = null;
     setActiveTopic(topicKey);
-    sendMessage(TOPIC_PROMPTS[topicKey], true);
+    setMessages([]);
+    void loadCorpus([topicKey as TopicKey]);
+  };
+
+  const runDetailed = () => {
+    if (loadingRef.current) return;
+    setTab('ai');
+    sendMessage(focusPrompt.current || TOPIC_PROMPTS[activeTopic] || TOPIC_PROMPTS.overview, true);
   };
 
   const handleSend = () => {
-    sendMessage(input);
+    if (!input.trim()) return;
+    setTab('ai');
+    sendMessage(input, false, corpus);
   };
 
   return (
@@ -359,7 +413,7 @@ ${selectedSiHua.starName}化${selectedSiHua.siHua}落在【${palaceName}】，�
                 key={t.key}
                 onClick={() => handleTopicClick(t.key)}
                 disabled={loading}
-                className="py-1.5 text-[10px] font-medium rounded-lg transition-all duration-150 disabled:opacity-40"
+                className="py-2 text-[14px] font-medium rounded-lg transition-all duration-150 disabled:opacity-40"
                 style={{
                   background: isActive ? 'rgba(212,168,67,0.12)' : 'transparent',
                   border: `1px solid ${isActive ? 'rgba(212,168,67,0.3)' : 'var(--t-border)'}`,
@@ -373,96 +427,134 @@ ${selectedSiHua.starName}化${selectedSiHua.siHua}落在【${palaceName}】，�
         </div>
       </div>
 
-      {/* ── Messages ── */}
-      <div ref={scrollRef} className="flex-1 overflow-y-auto p-4 space-y-4 min-h-0">
-
-        {/* Loading state before first message */}
-        {messages.length === 0 && (
-          <div className="flex flex-col items-center justify-center h-full text-center">
-            <div className="text-4xl mb-3" style={{ color: 'var(--t-gold)', opacity: 0.1 }}>✦</div>
-            <p className="text-[10px] animate-pulse" style={{ color: 'var(--t-faint)' }}>命格解读生成中…</p>
-          </div>
-        )}
-
-        <AnimatePresence initial={false}>
-          {messages.map((msg, i) => {
-            if (msg.role === 'user' && msg.hidden) return null;
-
-            if (msg.role === 'user') {
-              return (
-                <motion.div
-                  key={i}
-                  initial={{ opacity: 0, y: 6 }}
-                  animate={{ opacity: 1, y: 0 }}
-                  className="flex justify-end"
-                >
-                  <div
-                    className="max-w-[85%] rounded-xl px-3 py-2 text-[11px]"
-                    style={{
-                      background: 'rgba(212,168,67,0.08)',
-                      border: '1px solid rgba(212,168,67,0.18)',
-                      color: 'var(--t-gold)',
-                    }}
-                  >
-                    {msg.content}
-                  </div>
-                </motion.div>
-              );
-            }
-
-            // Assistant message
-            const isLastMsg = i === messages.length - 1;
-            return (
-              <motion.div
-                key={i}
-                initial={{ opacity: 0, y: 6 }}
-                animate={{ opacity: 1, y: 0 }}
-              >
-                <div
-                  className="text-[9px] tracking-widest mb-2 flex items-center gap-1.5"
-                  style={{ color: 'var(--t-faint)' }}
-                >
-                  <span style={{ color: 'var(--t-gold)', opacity: 0.4 }}>✦</span>
-                  命理解读
-                </div>
-                <AiContent text={msg.content} streaming={loading && isLastMsg} />
-              </motion.div>
-            );
-          })}
-        </AnimatePresence>
-      </div>
-
-      {/* ── Input ── */}
-      <div className="flex-shrink-0 px-3 pb-3 pt-2" style={{ borderTop: '1px solid var(--t-border)' }}>
-        <div className="flex gap-2">
-          <input
-            type="text"
-            value={input}
-            onChange={e => setInput(e.target.value)}
-            onKeyDown={e => e.key === 'Enter' && !e.shiftKey && handleSend()}
-            placeholder="继续追问，如：今年适合换工作吗？"
-            disabled={loading}
-            className="flex-1 rounded-lg px-3 py-2 text-[11px] focus:outline-none transition-colors"
-            style={{
-              background: 'var(--t-card)',
-              border: '1px solid var(--t-border)',
-              color: 'var(--t-text)',
-            }}
-          />
+      <div className="flex-shrink-0 flex gap-1 px-2 py-2" style={{ borderBottom: '1px solid var(--t-border)' }}>
+        {([['corpus', '成稿'], ['ai', 'AI推演']] as const).map(([id, label]) => (
           <button
-            onClick={handleSend}
-            disabled={loading || !input.trim()}
-            className="px-3 py-2 rounded-lg text-[11px] font-medium transition-all disabled:opacity-30 disabled:cursor-not-allowed"
+            key={id}
+            type="button"
+            onClick={() => setTab(id)}
+            className="flex-1 py-2.5 text-[15px] rounded-lg"
             style={{
-              background: 'rgba(212,168,67,0.15)',
-              border: '1px solid rgba(212,168,67,0.25)',
-              color: 'var(--t-gold)',
+              background: tab === id ? 'rgba(212,168,67,0.14)' : 'transparent',
+              border: `1px solid ${tab === id ? 'rgba(212,168,67,0.35)' : 'var(--t-border)'}`,
+              color: tab === id ? 'var(--t-gold)' : 'var(--t-faint)',
             }}
           >
-            {loading ? '…' : '追问'}
+            {label}
           </button>
-        </div>
+        ))}
       </div>
+
+      {tab === 'corpus' ? (
+        <div className="flex-1 overflow-y-auto px-3 py-3 min-h-0" style={{ maxHeight: '70vh' }}>
+          {corpusLoading && !corpus ? (
+            <p className="text-[15px] animate-pulse" style={{ color: 'var(--t-faint)' }}>正在读取这一年的成稿…</p>
+          ) : (
+            <AiContent text={corpus || '这一维还没有成稿。'} />
+          )}
+        </div>
+      ) : (
+        <>
+          <div className="flex-shrink-0 overflow-y-auto px-4 py-3" style={{ maxHeight: 280, borderBottom: '1px solid var(--t-border)' }}>
+            <div className="text-[13px] tracking-widest mb-2" style={{ color: 'var(--t-faint)' }}>原文</div>
+            {corpusLoading && !corpus ? (
+              <p className="text-[15px]" style={{ color: 'var(--t-faint)' }}>正在读取原文…</p>
+            ) : (
+              <AiContent text={corpus || '原文还没有。'} />
+            )}
+          </div>
+
+          <div ref={scrollRef} className="flex-1 overflow-y-auto p-4 space-y-4 min-h-0">
+            {messages.length === 0 && !loading && (
+              <p className="text-[15px] leading-relaxed" style={{ color: 'var(--t-faint)' }}>
+                上面是这一维的原文。可以追问其中某一句，或做细致推演。
+              </p>
+            )}
+            <AnimatePresence initial={false}>
+              {messages.map((msg, i) => {
+                if (msg.role === 'user' && msg.hidden) return null;
+                if (msg.role === 'user') {
+                  return (
+                    <motion.div key={i} initial={{ opacity: 0, y: 6 }} animate={{ opacity: 1, y: 0 }} className="flex justify-end">
+                      <div
+                        className="max-w-[85%] rounded-xl px-3 py-2 text-[15px]"
+                        style={{
+                          background: 'rgba(212,168,67,0.08)',
+                          border: '1px solid rgba(212,168,67,0.18)',
+                          color: 'var(--t-gold)',
+                        }}
+                      >
+                        {msg.content}
+                      </div>
+                    </motion.div>
+                  );
+                }
+                const isLastMsg = i === messages.length - 1;
+                const title = msg.kind === 'ask' ? '追问' : '细致推演';
+                return (
+                  <motion.div key={i} initial={{ opacity: 0, y: 6 }} animate={{ opacity: 1, y: 0 }} className="space-y-3">
+                    <ThinkingBlock text={msg.reasoning ?? ''} streaming={loading && isLastMsg && !msg.content} />
+                    <div className="rounded-xl px-3 py-3" style={{ background: 'rgba(212,168,67,0.06)', border: '1px solid rgba(212,168,67,0.2)' }}>
+                      <div className="text-[13px] tracking-widest mb-2" style={{ color: 'var(--t-gold)' }}>{title}</div>
+                      {msg.content ? (
+                        <AiContent text={msg.content} streaming={loading && isLastMsg} />
+                      ) : (
+                        <p className="text-[15px]" style={{ color: 'var(--t-faint)' }}>
+                          {loading && isLastMsg ? '正在整理这一段…' : '这一段没有正文。'}
+                        </p>
+                      )}
+                    </div>
+                  </motion.div>
+                );
+              })}
+            </AnimatePresence>
+          </div>
+
+          <div className="flex-shrink-0 px-3 pb-3 pt-2" style={{ borderTop: '1px solid var(--t-border)' }}>
+            <button
+              type="button"
+              onClick={runDetailed}
+              disabled={loading}
+              className="w-full mb-2 py-2.5 text-[15px] rounded-lg disabled:opacity-40"
+              style={{
+                background: 'rgba(212,168,67,0.15)',
+                border: '1px solid rgba(212,168,67,0.25)',
+                color: 'var(--t-gold)',
+              }}
+            >
+              {loading ? '推演中…' : '细致推演'}
+            </button>
+            <div className="flex gap-2">
+              <input
+                type="text"
+                value={input}
+                onChange={e => setInput(e.target.value)}
+                onKeyDown={e => e.key === 'Enter' && !e.shiftKey && handleSend()}
+                placeholder="追问原文里的细节"
+                disabled={loading}
+                className="flex-1 rounded-lg px-3 py-2.5 text-[15px] focus:outline-none transition-colors"
+                style={{
+                  background: 'var(--t-card)',
+                  border: '1px solid var(--t-border)',
+                  color: 'var(--t-text)',
+                }}
+              />
+              <button
+                onClick={handleSend}
+                disabled={loading || !input.trim()}
+                className="px-4 py-2.5 rounded-lg text-[15px] font-medium transition-all disabled:opacity-30 disabled:cursor-not-allowed"
+                style={{
+                  background: 'rgba(212,168,67,0.15)',
+                  border: '1px solid rgba(212,168,67,0.25)',
+                  color: 'var(--t-gold)',
+                }}
+              >
+                {loading ? '…' : '追问'}
+              </button>
+            </div>
+          </div>
+        </>
+      )}
 
     </div>
   );

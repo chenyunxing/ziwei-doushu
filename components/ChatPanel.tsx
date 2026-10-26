@@ -2,6 +2,7 @@
 import { useState, useRef, useEffect } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
 import type { ZiweiChart } from '@/lib/ziwei/types';
+import { readSse } from '@/lib/ai/read-sse';
 
 interface Message {
   role: 'user' | 'assistant';
@@ -23,6 +24,7 @@ const PRESET_QUESTIONS = [
 
 export default function ChatPanel({ chart }: ChatPanelProps) {
   const [messages, setMessages] = useState<Message[]>([]);
+  const [corpus, setCorpus] = useState('');
   const [input, setInput] = useState('');
   const [loading, setLoading] = useState(false);
   const scrollRef = useRef<HTMLDivElement>(null);
@@ -51,34 +53,19 @@ export default function ChatPanel({ chart }: ChatPanelProps) {
       if (!res.ok) throw new Error('请求失败');
       if (!res.body) throw new Error('无响应流');
 
-      const reader = res.body.getReader();
-      const decoder = new TextDecoder();
-      let assistantText = '';
-
       setMessages(prev => [...prev, { role: 'assistant', content: '' }]);
-
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        const chunk = decoder.decode(value, { stream: true });
-        const lines = chunk.split('\n');
-        for (const line of lines) {
-          if (line.startsWith('data: ')) {
-            const data = line.slice(6);
-            if (data === '[DONE]') break;
-            try {
-              const parsed = JSON.parse(data);
-              const delta = parsed.delta?.text ?? '';
-              assistantText += delta;
-              setMessages(prev => {
-                const updated = [...prev];
-                updated[updated.length - 1] = { role: 'assistant', content: assistantText };
-                return updated;
-              });
-            } catch { /* skip */ }
-          }
-        }
-      }
+      let assistantText = '';
+      await readSse(res.body, (ev) => {
+        if (typeof ev.corpus === 'string' && ev.corpus) setCorpus(ev.corpus);
+        const delta = ev.delta?.text ?? '';
+        if (!delta) return;
+        assistantText += delta;
+        setMessages(prev => {
+          const updated = [...prev];
+          updated[updated.length - 1] = { role: 'assistant', content: assistantText };
+          return updated;
+        });
+      });
     } catch (e) {
       const missing = e instanceof Error && e.message === 'api-missing';
       setMessages(prev => [...prev, {
@@ -97,6 +84,12 @@ export default function ChatPanel({ chart }: ChatPanelProps) {
         <h3 className="text-xs font-medium tracking-widest" style={{ color: 'var(--t-gold)' }}>AI 命盘解读</h3>
         <p className="text-[10px] mt-0.5" style={{ color: 'var(--t-faint)' }}>倪海厦正宗紫微斗数 · 智慧解析</p>
       </div>
+
+      {corpus && (
+        <div className="flex-shrink-0 overflow-y-auto px-4 py-3" style={{ maxHeight: 280, borderBottom: '1px solid var(--t-border)' }}>
+          <div className="whitespace-pre-wrap text-xs leading-relaxed" style={{ color: 'var(--t-text2)' }}>{corpus}</div>
+        </div>
+      )}
 
       {/* 消息列表 */}
       <div ref={scrollRef} className="flex-1 overflow-y-auto p-4 space-y-3 min-h-0">
